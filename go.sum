@@ -1,0 +1,4 @@
+github.com/gamexg/go-mempool v0.0.0-20200915060625-239c6a1f6d2a h1:LKeMMjdjd++Pjiy70sWco2ePLxuDISmSiAUfPMZ/l8w=
+github.com/gamexg/go-mempool v0.0.0-20200915060625-239c6a1f6d2a/go.mod h1:MrsDN1zSkuo0sJvke6wPO3U0MlzSoCdbL/A9o1FBUqE=
+github.com/gamexg/goio v0.0.0-20170104121325-75cf4a6f28a9 h1:phbvH+KsgoAd9WGoONwNo6mOWrpaApPqGx40sMFEtBk=
+github.com/gamexg/goio v0.0.0-20170104121325-75cf4a6f28a9/go.mod h1:xzbr7tJZae528RuEyHx1cEhRdiJ0UOsK2fWpiWc+WDY=
