@@ -160,6 +160,7 @@ func serverConnConnect(ctx context.Context, clientConn net.Conn, conf *Config, c
 		_ = cmdR.Write(clientConn)
 		return fmt.Errorf("DialContext, %v", err)
 	}
+	defer siteConn.Close()
 
 	if !conf.FastForward {
 		err := cmdR.Write(clientConn)
