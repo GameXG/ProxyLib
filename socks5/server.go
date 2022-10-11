@@ -3,44 +3,88 @@ package socks5
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/gamexg/goio"
+	"proxylib/goio"
 
-	"github.com/gamexg/go-mempool"
+	"proxylib/mempool"
 )
 
-type Dial interface {
-}
-
-type Config struct {
+type ServerConfig struct {
+	// socks5 握手超时时间
 	Socks5ShakeHandsTimeout time.Duration
-	DialTimeout             time.Duration
-	ForwardTimeout          time.Duration
-	// 32*1024
+
+	ForwardTimeout time.Duration
+	// 默认值 32*1024
 	ForwardBufSize int
 	// 快速转发
-	// true 时，不等到远程网站连接建立成功就返回 socks5连接已成功 cmdR 包
+	// true 时，不等到远程网站连接建立成功就返回 socks5 连接已成功 cmdR 包
+	// 使得 socks5 客户端可以立刻发出之后的请求(例如 http 请求)。
 	FastForward bool
 
-	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
+	// udp cmd addr 兼容
+	// 按照 rfc1928 标准，当 cmd 命令提供 addr 字段时，表明 socks5 客户端只会从这个地址向 socks5 服务端发出 udp 包，服务器要丢弃其他
+	// 地址发出的 udp 包。但是有些 socks5 客户端实现错误，会将目标网站的地址填入 cmd addr 字段内，造成 socks5 udp 无法工作。
+	// 本选项 UdpAssociateCmdAddrCompatibility 设置为 true 时，将忽略 cmd addr 字段设置，允许 socks5 客户端使用任意地址发出请求。
+	UdpAssociateCmdAddrCompatibility bool
+
+	// 向 目标网站 建立 tcp 连接使用的函数
+	SiteTcpDialContext func(ctx context.Context, network, address string) (net.Conn, error)
+	// 连接超时
+	SiteTcpDialContextDialTimeout time.Duration
+	// 向 目标网站 建立 udp 连接使用的函数
+	SiteUdpListen func(ctx context.Context) (net.PacketConn, error)
+	// SiteUdpListen 曹氏时间
+	SiteUdpListenTimeout time.Duration
+
+	// 向 socks5 客户端建立监听使用的函数
+	Socks5ClientUdpListen func(ctx context.Context, network string) (net.PacketConn, error)
+	// 向 socks5 客户端建立 udp 连接时使用的函数
+	// 为空则使用 Socks5ClientUdpListen ,并忽略来源检查
+	Socks5ClientUdpDial func(ctx context.Context, network, addr string) (net.PacketConn, error)
+	// Socks5ClientUdpListen、Socks5ClientUdpDial 超时时间
+	Socks5ClientUdpListenAndDialTimeout time.Duration
 
 	Socks5AuthCheckMethod          func(a []Socks5AuthMethodType) Socks5AuthMethodType
 	Socks5AuthCheckUserAndPassword func(user, password string) error
 }
 
-func (c *Config) Default() {
+func (c *ServerConfig) Default() {
 	dial := net.Dialer{}
 
-	*c = Config{
-		Socks5ShakeHandsTimeout: 10 * time.Second,
-		DialTimeout:             10 * time.Second,
-		ForwardTimeout:          2 * 60 * time.Second,
-		ForwardBufSize:          32 * 1024,
-		FastForward:             false,
-		DialContext:             dial.DialContext,
+	*c = ServerConfig{
+		Socks5ShakeHandsTimeout:          10 * time.Second,
+		ForwardTimeout:                   2 * 60 * time.Second,
+		ForwardBufSize:                   32 * 1024,
+		FastForward:                      false,
+		UdpAssociateCmdAddrCompatibility: false,
+		SiteTcpDialContext:               dial.DialContext,
+		SiteTcpDialContextDialTimeout:    10 * time.Second,
+		SiteUdpListen: func(ctx context.Context) (net.PacketConn, error) {
+			return net.ListenPacket("udp", ":0")
+		},
+		SiteUdpListenTimeout: 10 * time.Second,
+		Socks5ClientUdpListen: func(ctx context.Context, network string) (net.PacketConn, error) {
+			return net.ListenPacket(network, ":0")
+		},
+		Socks5ClientUdpDial: func(ctx context.Context, network, addr string) (net.PacketConn, error) {
+			d := net.Dialer{}
+			c, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+
+			udpConn, _ := c.(*net.UDPConn)
+			if udpConn == nil {
+				return nil, fmt.Errorf("非预期的 net.UDPConn 类型, %#v", c)
+			}
+
+			return udpConn, nil
+		},
+		Socks5ClientUdpListenAndDialTimeout: 10 * time.Second,
 		Socks5AuthCheckMethod: func(a []Socks5AuthMethodType) Socks5AuthMethodType {
 			for _, v := range a {
 				if v == Socks5AuthMethodTypeNone {
@@ -57,7 +101,7 @@ func (c *Config) Default() {
 }
 
 // 本连接会负责 c 和 dial新建的连接
-func ServeConn(ctx context.Context, c net.Conn, conf *Config) error {
+func ServeConn(ctx context.Context, c net.Conn, conf *ServerConfig) error {
 	lCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer c.Close()
@@ -118,9 +162,13 @@ func ServeConn(ctx context.Context, c net.Conn, conf *Config) error {
 			return err
 		}
 
-	// 暂时只支持 connect 命令
-	//case CSocks5Bind:
-	//case Socks5CmdTypeUdpAssociate:
+	case Socks5CmdTypeUdpAssociate:
+		err = serverConnUdpAssociate(lCtx, c, conf, &cmd, &cmdR)
+		if err != nil {
+			return err
+		}
+
+		//case CSocks5Bind:
 	default:
 		cmdR.Cmd = Socks5CmdReplyCommandNotSupported
 		_ = cmdR.Write(c)
@@ -130,7 +178,104 @@ func ServeConn(ctx context.Context, c net.Conn, conf *Config) error {
 	return nil
 }
 
-func serverConnConnect(ctx context.Context, clientConn net.Conn, conf *Config, cmd *Socks5CmdPack, cmdR *Socks5CmdPack) error {
+// 建立到 socks5 客户端的 udp 连接
+// 如果 src 为空，则内部使用 listen
+func serverConnUdpSocks5ClientDial(ctx context.Context, conf *ServerConfig, socks5ClientSrcAddr *net.UDPAddr, tpcConn net.Conn) (net.PacketConn, bool, error) {
+	if conf.Socks5ClientUdpDial == nil {
+		socks5ClientSrcAddr = nil
+	}
+
+	// dial
+	if socks5ClientSrcAddr != nil {
+		packConn, err := conf.Socks5ClientUdpDial(ctx, "udp", socks5ClientSrcAddr.String())
+		if err != nil {
+			return nil, true, err
+		}
+
+		return packConn, true, nil
+	}
+
+	// listen
+	if conf.Socks5ClientUdpListen == nil {
+		return nil, false, fmt.Errorf("conf.Socks5ClientUdpListen")
+	}
+
+	packConn, err := conf.Socks5ClientUdpListen(ctx, "udp")
+	if err != nil {
+		return nil, false, fmt.Errorf("Socks5ClientUdpListen, %v", err)
+	}
+
+	return packConn, false, nil
+}
+
+// 处理 udp 请求
+func serverConnUdpAssociate(ctx context.Context, clientConn net.Conn, conf *ServerConfig, cmd *Socks5CmdPack, cmdR *Socks5CmdPack) error {
+	s := newUdpServer(ctx, conf, clientConn, cmd, cmdR)
+	return s.Serve()
+}
+
+func getSocks5ListenUdpAddr(clientConn net.Conn, udpConn net.PacketConn) (*net.UDPAddr, error) {
+	localAddr := udpConn.LocalAddr()
+
+	localUdpAddr, _ := localAddr.(*net.UDPAddr)
+	if localUdpAddr == nil {
+		return nil, fmt.Errorf("localUdpAddr==nil, %#v", localAddr)
+	}
+
+	// 如果 udp 连接绑定了 ip，则直接使用
+	// todo: 检查 listen 不同情况下 ip 地址区别
+	if ip := localUdpAddr.IP; len(ip) != 0 &&
+		net.IPv4zero.Equal(ip) == false &&
+		net.IPv6zero.Equal(ip) == false {
+		return localUdpAddr, nil
+	}
+
+	localTcpAddr, _ := clientConn.LocalAddr().(*net.TCPAddr)
+	if localTcpAddr == nil {
+		return nil, fmt.Errorf("非预期的 tcp 本地地址， %#v", localTcpAddr)
+	}
+
+	localUdpAddr.IP = localTcpAddr.IP
+
+	return localUdpAddr, nil
+}
+
+// 判断 conn 是否是 ipv6 协议
+func ConnIsIpv6(c net.Conn) (bool, error) {
+	remoteAddr := c.RemoteAddr()
+
+	var ip net.IP
+	switch remoteAddr.(type) {
+	case *net.TCPAddr:
+		addr, _ := (remoteAddr).(*net.TCPAddr)
+		if addr == nil {
+			return false, fmt.Errorf("addr == nil")
+		}
+		ip = addr.IP
+	case *net.UDPAddr:
+		addr, _ := (remoteAddr).(*net.UDPAddr)
+		if addr == nil {
+			return false, fmt.Errorf("addr == nil")
+		}
+		ip = addr.IP
+	default:
+		return false, fmt.Errorf("remoteAddr 非预期地址类型 ,%#v", remoteAddr)
+	}
+
+	ipv4 := ip.To4()
+	if len(ipv4) == net.IPv4len {
+		return false, nil
+	}
+
+	ipv6 := ip.To16()
+	if len(ipv6) == net.IPv6len {
+		return true, nil
+	}
+
+	return false, fmt.Errorf("非预期的 ip 地址类型, %#v", ip)
+}
+
+func serverConnConnect(ctx context.Context, clientConn net.Conn, conf *ServerConfig, cmd *Socks5CmdPack, cmdR *Socks5CmdPack) error {
 	if conf.FastForward {
 		err := cmdR.Write(clientConn)
 		if err != nil {
@@ -138,7 +283,7 @@ func serverConnConnect(ctx context.Context, clientConn net.Conn, conf *Config, c
 		}
 	}
 
-	dialTimeout := conf.DialTimeout
+	dialTimeout := conf.SiteTcpDialContextDialTimeout
 	if dialTimeout == 0 {
 		dialTimeout = 60 * time.Second
 	}
@@ -153,12 +298,12 @@ func serverConnConnect(ctx context.Context, clientConn net.Conn, conf *Config, c
 		return fmt.Errorf("cmd.GetAddrString, %v", err)
 	}
 
-	siteConn, err := conf.DialContext(dialCtx, "tcp", rAddr)
+	siteConn, err := conf.SiteTcpDialContext(dialCtx, "tcp", rAddr)
 	if err != nil {
 		// 主机不可达
 		cmdR.Cmd = 0x04
 		_ = cmdR.Write(clientConn)
-		return fmt.Errorf("DialContext, %v", err)
+		return fmt.Errorf("SiteTcpDialContext, %v", err)
 	}
 	defer siteConn.Close()
 
@@ -236,7 +381,7 @@ func serverConnConnect(ctx context.Context, clientConn net.Conn, conf *Config, c
 	return getForwardErr()
 }
 
-func serverConnAuthPassword(c net.Conn, conf *Config) error {
+func serverConnAuthPassword(c io.ReadWriter, conf *ServerConfig) error {
 	// 读取账密
 	authPassword := Socks5AuthPasswordPack{}
 	err := authPassword.Read(c)
@@ -261,4 +406,59 @@ func serverConnAuthPassword(c net.Conn, conf *Config) error {
 		return fmt.Errorf("authPasswordR.Write, %v", err)
 	}
 	return nil
+}
+
+func ServerLinsten(ctx context.Context, ln net.Listener, conf *ServerConfig) error {
+	defer ln.Close()
+
+	lCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() {
+		<-lCtx.Done()
+		_ = ln.Close()
+	}()
+
+	var tempDelay time.Duration
+	for {
+		c, e := ln.Accept()
+		if e != nil {
+			if ne, ok := e.(net.Error); ok && ne.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				//	log.Warn("Accept error: %v; retrying in %v", e, tempDelay)
+				time.Sleep(tempDelay)
+				continue
+			}
+			return e
+		}
+		tempDelay = 0
+
+		//	log.Debug("已收到 %v 的请求，开始处理...", c.RemoteAddr())
+		go func() {
+			err := ServeConn(lCtx, c, conf)
+			if err != nil {
+				//
+			}
+		}()
+	}
+}
+
+func ServeAddr(ctx context.Context, network, addr string, conf *ServerConfig) error {
+	lCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ln, err := net.Listen(network, addr)
+	if err != nil {
+		return fmt.Errorf("net.Listen, %v", err)
+	}
+	defer ln.Close()
+
+	return ServerLinsten(lCtx, ln, conf)
 }

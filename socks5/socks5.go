@@ -5,9 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"proxylib/mempool"
 	"strconv"
-
-	"github.com/gamexg/go-mempool"
 )
 
 // socks5 版本号
@@ -30,36 +29,43 @@ const (
 // socks5 回复状态有： 成功、一般性失败、规则不允许转发、主机不可达、atyp不支持、cmd命令不支持 等
 type Socks5CmdType byte
 
-const Socks5CmdTypeConnect Socks5CmdType = 0x01
-const Socks5CmdTypeBind Socks5CmdType = 0x02
-const Socks5CmdTypeUdpAssociate Socks5CmdType = 0x3
+const (
+	Socks5CmdTypeConnect      Socks5CmdType = 0x01
+	Socks5CmdTypeBind         Socks5CmdType = 0x02
+	Socks5CmdTypeUdpAssociate Socks5CmdType = 0x3
 
-// cmd 回复，成功
-const Socks5CmdReplySucceeded Socks5CmdType = 0x00
+	// cmd 回复，成功
+	Socks5CmdReplySucceeded Socks5CmdType = 0x00
 
-// cmd 回复，普通SOCKS服务器连接失败
-const Socks5CmdReplyGeneralSocksServerFailure Socks5CmdType = 0x01
+	// cmd 回复，普通SOCKS服务器连接失败
+	Socks5CmdReplyGeneralSocksServerFailure Socks5CmdType = 0x01
 
-// cmd 回复，规则不允许
-const Socks5CmdReplyConnectionNotAllowedByRuleset Socks5CmdType = 0x02
+	// cmd 回复，规则不允许
+	Socks5CmdReplyConnectionNotAllowedByRuleset Socks5CmdType = 0x02
 
-// cmd 回复，网络不可达
-const Socks5CmdReplyNetworkUnreachable Socks5CmdType = 0x03
+	// cmd 回复，网络不可达
+	Socks5CmdReplyNetworkUnreachable Socks5CmdType = 0x03
 
-// cmd 回复，主机不可达
-const Socks5CmdReplyHostUnreachable Socks5CmdType = 0x04
+	// cmd 回复，主机不可达
+	Socks5CmdReplyHostUnreachable Socks5CmdType = 0x04
 
-// cmd 回复，连接被拒绝
-const Socks5CmdReplyConnectionRefused Socks5CmdType = 0x05
+	// cmd 回复，连接被拒绝
+	Socks5CmdReplyConnectionRefused Socks5CmdType = 0x05
 
-// cmd 回复，ttl超时
-const Socks5CmdReplyTtlExpired Socks5CmdType = 0x06
+	// cmd 回复，ttl超时
+	Socks5CmdReplyTtlExpired Socks5CmdType = 0x06
 
-// cmd 回复，不支持的命令
-const Socks5CmdReplyCommandNotSupported Socks5CmdType = 0x07
+	// cmd 回复，不支持的命令
+	Socks5CmdReplyCommandNotSupported Socks5CmdType = 0x07
 
-// cmd 回复，不支持的地址类型
-const Socks5CmdReplyAddressTypeNotSupported Socks5CmdType = 0x08
+	// cmd 回复，不支持的地址类型
+	Socks5CmdReplyAddressTypeNotSupported Socks5CmdType = 0x08
+
+	// 用户自定义范围 0x09- 0xFF
+
+	// 自定义，内部错误
+	Socks5CmdReplyInternalError Socks5CmdType = 0x010
+)
 
 // socks 5 cmd 命令 Atyp 类型
 type Socks5AtypType byte
@@ -82,19 +88,19 @@ const (
 	Socks5AuthPasswordRStatusTypeErr Socks5AuthPasswordRStatusType = 0x01
 )
 
-//鉴定请求
+// 鉴定请求
 type Socks5AuthPack struct {
 	Ver     byte // 版本5
 	Methods []Socks5AuthMethodType
 }
 
-//鉴定回应
+// 鉴定回应
 type Socks5AuthRPack struct {
 	Ver    byte // 版本 5
 	Method Socks5AuthMethodType
 }
 
-//命令及回应
+// 命令及回应
 type Socks5CmdPack struct {
 	Ver  byte // 版本 5
 	Cmd  Socks5CmdType
@@ -655,6 +661,8 @@ func (p *Socks5UdpPack) Parse(data []byte) error {
 		return fmt.Errorf("unexpected atyp %v", atyp)
 	}
 
+	*p = Socks5UdpPack{}
+
 	port := binary.BigEndian.Uint16(portData[:2])
 	udpData := portData[2:]
 
@@ -743,4 +751,58 @@ func (p *Socks5UdpPack) To(data []byte) (int, error) {
 	copy(data[4+hostSize+2:], p.Data)
 
 	return mustSize, nil
+}
+
+func (p *Socks5UdpPack) SetAddr(addr net.Addr) error {
+	udpAddr, _ := addr.(*net.UDPAddr)
+	if udpAddr == nil {
+		return fmt.Errorf("非预期的 udpAddr 格式, %v", addr)
+	}
+
+	err := p.SetAddrWIp(udpAddr.IP)
+	if err != nil {
+		return fmt.Errorf("SetAddrWIp,%v", err)
+	}
+
+	p.SetAddrWPort(udpAddr.Port)
+
+	return nil
+}
+
+func (p *Socks5UdpPack) SetAddrWIp(ip net.IP) error {
+	ipv4 := ip.To4()
+	if len(ipv4) == net.IPv4len {
+		p.Ip = ipv4
+		p.ATYP = Socks5CmdAtypTypeIP4
+		return nil
+	}
+
+	ipv6 := ip.To16()
+	if len(ipv6) != net.IPv6len {
+		p.Ip = ipv6
+		p.ATYP = Socks5CmdAtypTypeIP6
+		return nil
+	}
+
+	return fmt.Errorf("非预期的 ip 版本,%v", ip)
+}
+
+func (p *Socks5UdpPack) SetAddrWPort(port int) {
+	p.Port = uint16(port)
+}
+
+func (p *Socks5UdpPack) GetUdpAddr() (*net.UDPAddr, error) {
+
+	switch p.ATYP {
+	case Socks5CmdAtypTypeIP4, Socks5CmdAtypTypeIP6:
+		return &net.UDPAddr{
+			IP:   p.Ip,
+			Port: int(p.Port),
+			Zone: "",
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("非预期的地址类型")
+	}
+
 }
