@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"proxylib/mempool"
 	"strconv"
+
+	"github.com/gamexg/proxylib/mempool"
 )
 
 // socks5 版本号

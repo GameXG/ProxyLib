@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"proxylib/mempool"
+	"github.com/gamexg/proxylib/mempool"
 )
 
 // socks5 udp 客户端库

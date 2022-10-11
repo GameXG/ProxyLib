@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"proxylib/goio"
+	"github.com/gamexg/proxylib/goio"
 
-	"proxylib/mempool"
+	"github.com/gamexg/proxylib/mempool"
 )
 
 type ServerConfig struct {
